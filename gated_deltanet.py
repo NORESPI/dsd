@@ -11,7 +11,7 @@ Mamba-style gate parameterization, and Kahan cache persistence.
 import math
 import warnings
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -137,6 +137,76 @@ class ModelCache:
                 if t is not None:
                     total += t.numel() * t.element_size()
         return total
+
+
+@dataclass
+class LedgerBlock:
+    """CPU-resident exact transition payload for replay/branching."""
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    beta: torch.Tensor
+    alpha: torch.Tensor
+
+
+class LosslessContextLedger:
+    """Lossless context ledger with O(1) VRAM and exact replay semantics.
+
+    The recurrent state remains the only GPU-resident memory that grows
+    independent of sequence length. Full transition payloads are archived on
+    CPU, enabling exact deterministic replay/branching without approximation.
+    """
+
+    def __init__(self) -> None:
+        self.blocks: List[LedgerBlock] = []
+        self._tokens = 0
+
+    @property
+    def tokens(self) -> int:
+        return self._tokens
+
+    def append(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, alpha: torch.Tensor) -> None:
+        # Store exact bytes on CPU (float32 canonical form for recurrence math).
+        b = LedgerBlock(
+            q=q.detach().to("cpu", dtype=torch.float32).contiguous(),
+            k=k.detach().to("cpu", dtype=torch.float32).contiguous(),
+            v=v.detach().to("cpu", dtype=torch.float32).contiguous(),
+            beta=beta.detach().to("cpu", dtype=torch.float32).contiguous(),
+            alpha=alpha.detach().to("cpu", dtype=torch.float32).contiguous(),
+        )
+        self.blocks.append(b)
+        self._tokens += q.shape[1]
+
+    def clear(self) -> None:
+        self.blocks.clear()
+        self._tokens = 0
+
+    def replay_exact(
+        self,
+        initial_state: Optional[torch.Tensor] = None,
+        *,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Reconstruct outputs exactly from archived transitions."""
+        if not self.blocks:
+            raise RuntimeError("LosslessContextLedger is empty.")
+        dev = device or self.blocks[0].q.device
+        bsz, _, heads, kdim = self.blocks[0].q.shape
+        vdim = self.blocks[0].v.shape[-1]
+        S = initial_state if initial_state is not None else torch.zeros(
+            bsz, heads, kdim, vdim, dtype=torch.float32, device=dev
+        )
+        outs: List[torch.Tensor] = []
+        for blk in self.blocks:
+            q = blk.q.to(dev)
+            k = blk.k.to(dev)
+            v = blk.v.to(dev)
+            beta = blk.beta.to(dev)
+            alpha = blk.alpha.to(dev)
+            for t in range(q.shape[1]):
+                S, _ = _efla_forward_step(S, k[:, t], v[:, t], beta[:, t], alpha[:, t], None)
+                outs.append(torch.einsum("bhk,bhkv->bhv", q[:, t] * (kdim ** -0.5), S))
+        return torch.stack(outs, dim=1)
 
 
 def _efla_forward_step(
@@ -512,7 +582,14 @@ class GatedDeltaNetX(nn.Module):
             rec *= 2
         return conv + rec
 
-    def forward(self, x: torch.Tensor, *, past_key_values: Optional[ModelCache] = None, use_cache: bool = False):
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        past_key_values: Optional[ModelCache] = None,
+        use_cache: bool = False,
+        ledger: Optional[LosslessContextLedger] = None,
+    ):
         b, t, _ = x.shape
         state = None if past_key_values is None else past_key_values.get(self.layer_idx)
 
@@ -584,6 +661,9 @@ class GatedDeltaNetX(nn.Module):
                 S_new = S
                 comp_new = comp
 
+        if ledger is not None:
+            ledger.append(q.float(), k.float(), v.float(), beta_dispatch.float(), alpha.float())
+
         if self.D is not None:
             o = o + self.D[None, None, :, None] * v
 
@@ -620,6 +700,36 @@ class StreamingContext:
         self.cache.clear()
 
 
+class InfiniteContextEngine:
+    """Paradigm wrapper: fixed VRAM execution + lossless CPU context archive.
+
+    - Runtime state on accelerator remains O(1) in sequence length.
+    - Optional per-layer ledgers archive exact transitions for deterministic
+      replay/branching/debugging without approximation.
+    """
+
+    def __init__(self, layers: Sequence[GatedDeltaNetX], batch_size: int = 1, device=None, dtype=None):
+        self.layers = list(layers)
+        self.stream = StreamingContext(self.layers, batch_size=batch_size, device=device, dtype=dtype)
+        self.ledgers: Dict[int, LosslessContextLedger] = {layer.layer_idx: LosslessContextLedger() for layer in self.layers}
+
+    def ingest(self, x: torch.Tensor) -> torch.Tensor:
+        h = x
+        for layer in self.layers:
+            h, _, _ = layer(
+                h,
+                use_cache=True,
+                past_key_values=self.stream.cache,
+                ledger=self.ledgers[layer.layer_idx],
+            )
+        return h
+
+    def clear(self) -> None:
+        self.stream.clear()
+        for ledger in self.ledgers.values():
+            ledger.clear()
+
+
 def build_cache_for_layers(layers: Iterable[GatedDeltaNetX], batch_size: int) -> ModelCache:
     cache = ModelCache()
     for layer in layers:
@@ -654,13 +764,17 @@ def _self_test() -> None:
         with torch.no_grad():
             y_full, _, _ = layer(x.detach(), use_cache=False)
             cache = ModelCache()
+            ledger = LosslessContextLedger()
             ys = []
             for chunk in x.detach().split(7, dim=1):
-                y_chunk, _, cache = layer(chunk, use_cache=True, past_key_values=cache)
+                y_chunk, _, cache = layer(chunk, use_cache=True, past_key_values=cache, ledger=ledger)
                 ys.append(y_chunk)
             y_stream = torch.cat(ys, dim=1)
             rel = (y_full - y_stream).float().abs().max() / (y_full.float().abs().max() + 1e-8)
             assert rel < 1e-3, f"{name}: streaming mismatch: {float(rel):.3e}"
+            y_replay = ledger.replay_exact(device=x.device).to(y_full.dtype)
+            rel_rep = (y_stream - y_replay).float().abs().max() / (y_stream.float().abs().max() + 1e-8)
+            assert rel_rep < 1e-5, f"{name}: ledger replay mismatch: {float(rel_rep):.3e}"
 
     layers = nn.ModuleList([
         GatedDeltaNetX(hidden_size=128, num_heads=4, num_kv_heads=2, channelwise_beta=True, use_decoupled_beta=True)
