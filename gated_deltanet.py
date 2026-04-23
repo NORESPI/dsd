@@ -17,6 +17,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:  # pragma: no cover
+    triton = None
+    tl = None
+    _HAS_TRITON = False
 
 try:
     from torch.amp import custom_fwd as _custom_fwd, custom_bwd as _custom_bwd
@@ -28,6 +37,7 @@ except Exception:  # pragma: no cover
 
 
 def l2_norm_fn(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Per-token L2 normalization on the last dimension."""
     return x / (x.float().pow(2).sum(dim=-1, keepdim=True).add(eps).sqrt().to(x.dtype))
 
 
@@ -71,7 +81,6 @@ class ShortConvolution(nn.Conv1d):
             outs = []
             for t in range(l):
                 buf = torch.roll(buf, shifts=-1, dims=-1)
-                buf = buf.clone()
                 buf[:, :, -1] = x[:, t]
                 y_t = (buf * w.unsqueeze(0)).sum(-1)
                 if self.bias is not None:
@@ -137,6 +146,11 @@ def _efla_forward_step(
     log_alpha: Optional[torch.Tensor] = None,
     comp: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Closed-form EFLA rank-1 recurrent step.
+
+    S_t = exp(-beta k k^T) (alpha * S_{t-1}) + w k v^T
+    where w = (1-exp(-eta))/eta and eta = beta ||k||^2 (headwise effective).
+    """
     if beta.dim() == k.dim():
         eta = (beta * k * k).sum(-1, keepdim=True)
         k_eff = beta.sqrt() * k
@@ -177,6 +191,7 @@ def _efla_inverse_step(
     beta: torch.Tensor,
     log_alpha: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Exact analytical inverse of `_efla_forward_step` (without Kahan state)."""
     if beta.dim() == k.dim():
         eta = (beta * k * k).sum(-1, keepdim=True)
         k_eff = beta.sqrt() * k
@@ -202,7 +217,96 @@ def _efla_inverse_step(
     return S_prev
 
 
+if _HAS_TRITON:
+    @triton.jit
+    def _fused_recurrent_efla_fwd(
+        q, k, v, alpha, o, h0, ht,
+        scale,
+        T: tl.constexpr,
+        H: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+        BK: tl.constexpr, BV: tl.constexpr,
+        USE_INITIAL_STATE: tl.constexpr,
+        STORE_FINAL_STATE: tl.constexpr,
+    ):
+        i_v, i_bh = tl.program_id(0), tl.program_id(1)
+        i_n = i_bh // H
+        i_h = i_bh % H
+        o_k = tl.arange(0, BK)
+        o_v = i_v * BV + tl.arange(0, BV)
+        mask_k = o_k < K
+        mask_v = o_v < V
+        mask_h = mask_k[:, None] & mask_v[None, :]
+
+        bos = i_n * T
+        p_q = q + (bos * H + i_h) * K + o_k
+        p_k = k + (bos * H + i_h) * K + o_k
+        p_v = v + (bos * H + i_h) * V + o_v
+        p_a = alpha + bos * H + i_h
+        p_o = o + (bos * H + i_h) * V + o_v
+
+        b_h = tl.zeros([BK, BV], dtype=tl.float32)
+        if USE_INITIAL_STATE:
+            p_h0 = h0 + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
+            b_h = tl.load(p_h0, mask=mask_h, other=0.0).to(tl.float32)
+
+        for _ in tl.range(0, T):
+            b_q = tl.load(p_q, mask=mask_k, other=0.0).to(tl.float32) * scale
+            b_k = tl.load(p_k, mask=mask_k, other=0.0).to(tl.float32)
+            b_v = tl.load(p_v, mask=mask_v, other=0.0).to(tl.float32)
+            b_a = tl.load(p_a).to(tl.float32)
+
+            # beta has been absorbed into k/v beforehand.
+            eta = tl.sum(b_k * b_k)
+            safe_eta = tl.where(eta > 1e-12, eta, 1.0)
+            w = tl.where(eta > 1e-12, (1.0 - tl.exp(-eta)) / safe_eta, 1.0 - 0.5 * eta)
+            c = tl.where(eta > 1e-12, (tl.exp(-eta) - 1.0) / safe_eta, -(1.0 - 0.5 * eta))
+
+            b_h = b_h * tl.exp(b_a)
+            kTS = tl.sum(b_h * b_k[:, None], axis=0)
+            b_h = b_h + c * b_k[:, None] * kTS[None, :]
+            b_h = b_h + w * b_k[:, None] * b_v[None, :]
+
+            b_o = tl.sum(b_h * b_q[:, None], axis=0)
+            tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
+
+            p_q += H * K
+            p_k += H * K
+            p_v += H * V
+            p_a += H
+            p_o += H * V
+
+        if STORE_FINAL_STATE:
+            p_ht = ht + i_bh * K * V + o_k[:, None] * V + o_v[None, :]
+            tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+
+
+def _triton_recurrent_efla(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor,
+    initial_state: Optional[torch.Tensor],
+    output_final_state: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    b, t, h, kdim = q.shape
+    vdim = v.shape[-1]
+    bk = triton.next_power_of_2(kdim)
+    bv = min(32, triton.next_power_of_2(vdim))
+    nv = triton.cdiv(vdim, bv)
+    out = torch.empty_like(v)
+    ht = q.new_empty(b, h, kdim, vdim, dtype=torch.float32) if output_final_state else None
+    _fused_recurrent_efla_fwd[(nv, b * h)](
+        q, k, v, alpha, out, initial_state, ht, kdim ** -0.5, t,
+        H=h, K=kdim, V=vdim, BK=bk, BV=bv,
+        USE_INITIAL_STATE=initial_state is not None,
+        STORE_FINAL_STATE=output_final_state,
+        num_warps=1, num_stages=3,
+    )
+    return out, ht
+
+
 class ReversibleRecurrence(torch.autograd.Function):
+    """Reversible BPTT for the EFLA recurrence with O(1)-length activation memory."""
     @staticmethod
     @custom_fwd
     def forward(ctx, q, k, v, beta, log_alpha, init_state, scale):
@@ -292,7 +396,17 @@ class GatedDeltaNetX(nn.Module):
         reversible_backprop: bool = True,
         use_mamba_gate: bool = True,
         use_residual: bool = True,
+        gate_fn: str = "swish",  # swish | engram
+        use_decoupled_beta: bool = False,
     ):
+        """Single production layer with causal conv + GQA + EFLA recurrence.
+
+        Key features:
+        - streaming cache with fixed-size recurrent state;
+        - optional reversible backprop;
+        - optional Mamba-style gate parameterization;
+        - optional channelwise or decoupled beta projections (FG²-GDN+ style).
+        """
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -308,6 +422,8 @@ class GatedDeltaNetX(nn.Module):
         self.reversible_backprop = reversible_backprop
         self.use_mamba_gate = use_mamba_gate
         self.use_residual = use_residual
+        self.gate_fn = gate_fn
+        self.use_decoupled_beta = use_decoupled_beta and channelwise_beta
 
         self.key_dim = int(hidden_size * expand_k)
         self.value_dim = int(hidden_size * expand_v)
@@ -329,6 +445,7 @@ class GatedDeltaNetX(nn.Module):
 
         beta_out = self.key_dim if channelwise_beta else num_heads
         self.beta_proj = nn.Linear(hidden_size, beta_out, bias=True)
+        self.beta_v_proj = nn.Linear(hidden_size, self.key_dim, bias=True) if self.use_decoupled_beta else None
         self.alpha_proj = nn.Linear(hidden_size, num_heads, bias=not use_mamba_gate)
 
         if use_mamba_gate:
@@ -365,6 +482,12 @@ class GatedDeltaNetX(nn.Module):
         if self.qk_norm == "softmax":
             return q.softmax(dim=-1), k.softmax(dim=-1)
         return q, k
+
+    def _apply_output_gate(self, o: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+        if self.gate_fn == "engram":
+            gate = torch.sigmoid(g.abs().clamp(min=1e-6).sqrt() * g.sign())
+            return self.o_norm(o) * gate * g
+        return self.o_norm(o) * F.silu(g)
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> LayerState:
         p = next(self.parameters())
@@ -414,8 +537,13 @@ class GatedDeltaNetX(nn.Module):
 
         if self.channelwise_beta:
             beta = self.beta_proj(x).float().sigmoid().view(b, t, self.num_heads, self.k_head)
+            beta_v = self.beta_v_proj(x).float().sigmoid().view(b, t, self.num_heads, self.k_head) if self.beta_v_proj is not None else beta
+            k = k * beta.sqrt()
+            if self.k_head == self.v_head:
+                v = v * beta_v.sqrt()
+            beta_dispatch = torch.ones(b, t, self.num_heads, device=x.device, dtype=torch.float32)
         else:
-            beta = self.beta_proj(x).float().sigmoid()
+            beta_dispatch = self.beta_proj(x).float().sigmoid()
 
         init_S = None if state is None else state.recurrent
         comp = None if state is None else state.recurrent_comp
@@ -425,25 +553,39 @@ class GatedDeltaNetX(nn.Module):
             if self.use_kahan_state and not self._warned_reversible_kahan:
                 warnings.warn("Kahan compensation is disabled in reversible training for exact graph consistency.")
                 self._warned_reversible_kahan = True
-            o, S_new = ReversibleRecurrence.apply(q, k, v, beta, alpha, init_S, scale)
+            o, S_new = ReversibleRecurrence.apply(q, k, v, beta_dispatch, alpha, init_S, scale)
             comp_new = None
         else:
             S = init_S if init_S is not None else torch.zeros(b, self.num_heads, self.k_head, self.v_head, device=x.device, dtype=torch.float32)
             if comp is None and self.use_kahan_state:
                 comp = torch.zeros_like(S)
-            out = []
-            for i in range(t):
-                S, comp = _efla_forward_step(S, k[:, i].float(), v[:, i].float(), beta[:, i], alpha[:, i], comp)
-                out.append(torch.einsum("bhk,bhkv->bhv", q[:, i].float() * scale, S))
-            o = torch.stack(out, dim=1).to(v.dtype)
-            S_new = S
-            comp_new = comp
+            can_triton = (
+                _HAS_TRITON
+                and x.is_cuda
+                and (not self.training)
+                and (not self.use_kahan_state)
+                and (beta_dispatch.dim() == 3 and torch.all(beta_dispatch == 1))
+            )
+            if can_triton:
+                o, S_new = _triton_recurrent_efla(
+                    q.float(), k.float(), v.float(), alpha.float(), S, output_final_state=True
+                )
+                o = o.to(v.dtype)
+                comp_new = None
+            else:
+                out = []
+                for i in range(t):
+                    S, comp = _efla_forward_step(S, k[:, i].float(), v[:, i].float(), beta_dispatch[:, i], alpha[:, i], comp)
+                    out.append(torch.einsum("bhk,bhkv->bhv", q[:, i].float() * scale, S))
+                o = torch.stack(out, dim=1).to(v.dtype)
+                S_new = S
+                comp_new = comp
 
         if self.D is not None:
             o = o + self.D[None, None, :, None] * v
 
         g = self.g_proj(x).view(b, t, self.num_heads, self.v_head)
-        o = self.o_norm(o) * F.silu(g)
+        o = self._apply_output_gate(o, g)
         y = self.o_proj(o.reshape(b, t, self.value_dim))
 
         if use_cache and past_key_values is not None:
@@ -483,28 +625,57 @@ def build_cache_for_layers(layers: Iterable[GatedDeltaNetX], batch_size: int) ->
 
 
 def _self_test() -> None:
+    """Smoke + invariants:
+    - forward/backward;
+    - streaming vs full equivalence;
+    - state bytes invariant across sequence lengths.
+    """
     torch.manual_seed(0)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
-    layer = GatedDeltaNetX(hidden_size=128, num_heads=4, num_kv_heads=2, use_residual=True).to(device=device, dtype=dtype)
-    x = torch.randn(2, 48, 128, device=device, dtype=dtype, requires_grad=True)
+    cfgs = [
+        dict(name="baseline", channelwise_beta=False, gate_fn="swish", use_mamba_gate=False),
+        dict(name="fg2", channelwise_beta=True, gate_fn="swish", use_mamba_gate=True),
+        dict(name="fg2+engram+gqa", channelwise_beta=True, gate_fn="engram", num_kv_heads=2, use_decoupled_beta=True),
+    ]
+    for cfg in cfgs:
+        name = cfg.pop("name")
+        layer = GatedDeltaNetX(hidden_size=128, num_heads=4, use_residual=True, **cfg).to(device=device, dtype=dtype)
+        x = torch.randn(2, 48, 128, device=device, dtype=dtype, requires_grad=True)
 
-    y, _, _ = layer(x)
-    y.float().mean().backward()
+        y, _, _ = layer(x)
+        y.float().mean().backward()
+        assert y.shape == x.shape and not torch.isnan(y).any(), f"{name}: fwd/bwd invalid"
 
+        with torch.no_grad():
+            y_full, _, _ = layer(x.detach(), use_cache=False)
+            cache = ModelCache()
+            ys = []
+            for chunk in x.detach().split(7, dim=1):
+                y_chunk, _, cache = layer(chunk, use_cache=True, past_key_values=cache)
+                ys.append(y_chunk)
+            y_stream = torch.cat(ys, dim=1)
+            rel = (y_full - y_stream).float().abs().max() / (y_full.float().abs().max() + 1e-8)
+            assert rel < 1e-3, f"{name}: streaming mismatch: {float(rel):.3e}"
+
+    layers = nn.ModuleList([
+        GatedDeltaNetX(hidden_size=128, num_heads=4, num_kv_heads=2, channelwise_beta=True, use_decoupled_beta=True)
+        .to(device=device, dtype=dtype)
+        for _ in range(3)
+    ])
+    baseline = build_cache_for_layers(list(layers), batch_size=2).bytes()
     with torch.no_grad():
-        y_full, _, _ = layer(x.detach(), use_cache=False)
-        cache = ModelCache()
-        ys = []
-        for chunk in x.detach().split(7, dim=1):
-            y_chunk, _, cache = layer(chunk, use_cache=True, past_key_values=cache)
-            ys.append(y_chunk)
-        y_stream = torch.cat(ys, dim=1)
-        rel = (y_full - y_stream).float().abs().max() / (y_full.float().abs().max() + 1e-8)
-        assert rel < 1e-3, f"streaming mismatch: {float(rel):.3e}"
+        for l in (8, 64, 256, 1024):
+            cache = build_cache_for_layers(list(layers), batch_size=2)
+            h = torch.randn(2, l, 128, device=device, dtype=dtype)
+            for i in range(l):
+                ht = h[:, i : i + 1]
+                for layer in layers:
+                    ht, _, cache = layer(ht, use_cache=True, past_key_values=cache)
+            assert cache.bytes() == baseline, f"state bytes changed at L={l}"
 
-    print("self-test passed")
+    print("self-test passed (streaming + O(1) bytes)")
 
 
 if __name__ == "__main__":
