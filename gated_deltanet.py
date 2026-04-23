@@ -80,8 +80,9 @@ class ShortConvolution(nn.Conv1d):
             w = self.weight.squeeze(1)
             outs = []
             for t in range(l):
-                buf = torch.roll(buf, shifts=-1, dims=-1)
-                buf[:, :, -1] = x[:, t]
+                new_buf = torch.roll(buf, shifts=-1, dims=-1).clone()
+                new_buf[:, :, -1] = x[:, t].detach()
+                buf = new_buf
                 y_t = (buf * w.unsqueeze(0)).sum(-1)
                 if self.bias is not None:
                     y_t = y_t + self.bias
@@ -486,7 +487,7 @@ class GatedDeltaNetX(nn.Module):
     def _apply_output_gate(self, o: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
         if self.gate_fn == "engram":
             gate = torch.sigmoid(g.abs().clamp(min=1e-6).sqrt() * g.sign())
-            return self.o_norm(o) * gate * g
+            return self.o_norm(o) * gate
         return self.o_norm(o) * F.silu(g)
 
     def init_state(self, batch_size: int, device=None, dtype=None) -> LayerState:
@@ -542,8 +543,10 @@ class GatedDeltaNetX(nn.Module):
             if self.k_head == self.v_head:
                 v = v * beta_v.sqrt()
             beta_dispatch = torch.ones(b, t, self.num_heads, device=x.device, dtype=torch.float32)
+            beta_absorbed = True
         else:
             beta_dispatch = self.beta_proj(x).float().sigmoid()
+            beta_absorbed = False
 
         init_S = None if state is None else state.recurrent
         comp = None if state is None else state.recurrent_comp
@@ -564,7 +567,7 @@ class GatedDeltaNetX(nn.Module):
                 and x.is_cuda
                 and (not self.training)
                 and (not self.use_kahan_state)
-                and (beta_dispatch.dim() == 3 and torch.all(beta_dispatch == 1))
+                and beta_absorbed
             )
             if can_triton:
                 o, S_new = _triton_recurrent_efla(
@@ -674,6 +677,24 @@ def _self_test() -> None:
                 for layer in layers:
                     ht, _, cache = layer(ht, use_cache=True, past_key_values=cache)
             assert cache.bytes() == baseline, f"state bytes changed at L={l}"
+
+    # Gradient parity smoke: reversible path vs non-reversible on same weights.
+    torch.manual_seed(123)
+    layer_ref = GatedDeltaNetX(hidden_size=64, num_heads=4, reversible_backprop=False, use_kahan_state=False).to(device=device, dtype=dtype)
+    layer_rev = GatedDeltaNetX(hidden_size=64, num_heads=4, reversible_backprop=True, use_kahan_state=False).to(device=device, dtype=dtype)
+    layer_rev.load_state_dict(layer_ref.state_dict())
+    x0 = torch.randn(2, 16, 64, device=device, dtype=dtype)
+    x1 = x0.clone().detach().requires_grad_(True)
+    x2 = x0.clone().detach().requires_grad_(True)
+    y1, _, _ = layer_ref(x1)
+    y2, _, _ = layer_rev(x2)
+    loss1 = y1.float().pow(2).mean()
+    loss2 = y2.float().pow(2).mean()
+    loss1.backward()
+    loss2.backward()
+    gx_err = (x1.grad.float() - x2.grad.float()).abs().max()
+    gx_den = x1.grad.float().abs().max() + 1e-8
+    assert (gx_err / gx_den).item() < 5e-2, "reversible gradient mismatch too large"
 
     print("self-test passed (streaming + O(1) bytes)")
 
